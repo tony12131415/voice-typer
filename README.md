@@ -48,7 +48,9 @@ pip install -r requirements.txt
 ./build_app.sh
 ```
 
-會在 `/Applications/Voice Typer.app` 產生一個可以雙擊開啟的 App。
+用 [py2app](https://py2app.readthedocs.io/)（alias mode）在 `/Applications/Voice Typer.app` 產生一個可以雙擊開啟的原生 App bundle。
+
+> 如果只是單純用 shell script 包一層 `exec python3 voice_typer.py`，因為程式用 PyObjC 建立真正的 Cocoa GUI（Dock 選單那些），Homebrew 的 Python 會透過它內建的 `Python.app` launcher 來啟動 GUI 部分，導致 Dock/Activity Monitor 顯示成「Python」而不是「Voice Typer」。用 py2app 建出真正的原生執行檔就不會有這個問題。
 
 ## 權限設定（macOS 必要步驟）
 
@@ -62,7 +64,7 @@ pip install -r requirements.txt
 
 第一次錄音時系統會另外跳出麥克風權限詢問，允許即可。
 
-> 手動用 Terminal 跑的話，權限要加在啟動 python 的那個終端機 App 身上，不是 python 執行檔本身（macOS 對命令列工具的權限判定，通常認的是「啟動它的那個 App」）。打包成 `.app` 之後，因為換了一個新的 App 身份，需要重新對 `Voice Typer.app` 授權一次。
+> 手動用 Terminal 跑的話，權限要加在啟動 python 的那個終端機 App 身上，不是 python 執行檔本身（macOS 對命令列工具的權限判定，通常認的是「啟動它的那個 App」）。打包成 `.app` 之後，因為換了一個新的 App 身份，需要重新對 `Voice Typer.app` 授權一次；用 `build_app.sh` 重新打包更新時，因為 bundle 內容變了，通常也要重新授權一次。
 
 ## 使用方式
 

@@ -1,56 +1,32 @@
 #!/bin/bash
-# 產生 Voice Typer.app，安裝到 /Applications
+# 用 py2app（alias mode）建置 Voice Typer.app，安裝到 /Applications。
+# alias mode 只建立一個原生的 App bundle 殼，執行時仍然參照 venv 裡的套件，
+# 不整包內嵌 numpy/sounddevice 這類原生擴充套件，避免打包出問題。
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$HOME/venvs/breeze-asr"
-APP_DIR="/Applications/Voice Typer.app"
 
-mkdir -p "$APP_DIR/Contents/MacOS"
+cd "$SCRIPT_DIR"
+source "$VENV_DIR/bin/activate"
 
-cat > "$APP_DIR/Contents/Info.plist" << 'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key>
-    <string>Voice Typer</string>
-    <key>CFBundleDisplayName</key>
-    <string>Voice Typer</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.tony.voicetyper</string>
-    <key>CFBundleVersion</key>
-    <string>1.0</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
-    <key>CFBundleExecutable</key>
-    <string>VoiceTyper</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>11.0</string>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>Voice Typer 需要使用麥克風來錄下你要轉錄的語音。</string>
-</dict>
-</plist>
-PLIST
+rm -rf build dist
+python3 setup.py py2app -A
 
-cat > "$APP_DIR/Contents/MacOS/VoiceTyper" << LAUNCHER
-#!/bin/bash
-LOG="\$HOME/Library/Logs/VoiceTyper.log"
-mkdir -p "\$(dirname "\$LOG")"
+rm -rf "/Applications/Voice Typer.app"
+cp -R "dist/Voice Typer.app" "/Applications/"
 
-{
-    echo "=== \$(date) ==="
-    source "$VENV_DIR/bin/activate"
-    exec python3 -u "$SCRIPT_DIR/voice_typer.py"
-} >> "\$LOG" 2>&1
-LAUNCHER
+# build/dist 留在專案資料夾裡的話，Spotlight/Launchpad 會把它們也當成
+# 獨立的 App 顯示出來，造成看起來有兩個 Voice Typer，用完就清掉。
+rm -rf build dist
 
-chmod +x "$APP_DIR/Contents/MacOS/VoiceTyper"
-
-echo "已建立: $APP_DIR"
 echo ""
-echo "第一次執行前，記得到「系統設定 → 隱私權與安全性」把 Voice Typer 加進："
-echo "  - 輸入監控 (Input Monitoring)"
-echo "  - 輔助使用 (Accessibility)"
+echo "已建立: /Applications/Voice Typer.app"
+echo ""
+echo "第一次執行前，記得："
+echo "1. 系統設定 → 隱私權與安全性 → 輸入監控 → 加入 Voice Typer"
+echo "2. 系統設定 → 隱私權與安全性 → 輔助使用 → 加入 Voice Typer"
+echo "3. 系統設定 → 鍵盤 → 「按下 🌐 (Fn) 鍵時」→ 設成「不執行任何動作」"
+echo ""
+echo "（如果是重新打包更新既有的 App，因為 bundle 內容變了，"
+echo " 上面兩個權限通常需要重新授權一次）"

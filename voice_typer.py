@@ -16,6 +16,7 @@ Quit 跟 Ctrl+C（終端機執行時）都會一併關閉背景的 whisper-serve
 """
 
 import atexit
+import os
 import signal
 import subprocess
 import sys
@@ -24,6 +25,24 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+
+# 用 Finder/py2app 雙擊開啟時，這個行程完全沒有 LANG/LC_CTYPE 這類 locale
+# 環境變數（不像從 Terminal 跑會繼承 shell 的設定）。pbcopy 這類系統工具會
+# 依賴這些變數判斷輸入內容的編碼，沒有的話會用錯誤的編碼解讀我們傳進去的
+# UTF-8 位元組，貼到剪貼簿上的中文字就會變成亂碼。這裡用 setdefault 補上，
+# 已經有設定的話（例如 Terminal 手動執行）就不覆蓋。
+os.environ.setdefault("LANG", "en_US.UTF-8")
+os.environ.setdefault("LC_ALL", "en_US.UTF-8")
+
+# 用 App 雙擊開啟時沒有終端機可以看輸出，把 stdout/stderr 導進 log 檔；
+# 用 Terminal 手動跑（有 tty）的話維持印在畫面上方便除錯。
+if not sys.stdout.isatty():
+    LOG_PATH = Path.home() / "Library" / "Logs" / "VoiceTyper.log"
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _log_file = open(LOG_PATH, "a", buffering=1, encoding="utf-8")
+    sys.stdout = _log_file
+    sys.stderr = _log_file
+    print(f"=== {datetime.now()} ===")
 
 import numpy as np
 import opencc
@@ -88,7 +107,13 @@ def _append_line_to_transcript_doc(line: str) -> None:
     end tell
     '''
     try:
-        subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+        subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+        )
     except Exception as e:
         print(f"[transcript] 寫入 TextEdit 失敗（忽略，不影響貼上）: {e}")
 
@@ -220,8 +245,10 @@ def _process_recording(frames) -> None:
 
 
 def paste_via_clipboard(text: str) -> None:
-    old_clipboard = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
-    subprocess.run(["pbcopy"], input=text, text=True)
+    old_clipboard = subprocess.run(
+        ["pbpaste"], capture_output=True, text=True, encoding="utf-8"
+    ).stdout
+    subprocess.run(["pbcopy"], input=text, text=True, encoding="utf-8")
     time.sleep(0.05)
 
     kb.press(Key.cmd)
@@ -230,7 +257,7 @@ def paste_via_clipboard(text: str) -> None:
     kb.release(Key.cmd)
 
     time.sleep(0.3)
-    subprocess.run(["pbcopy"], input=old_clipboard, text=True)
+    subprocess.run(["pbcopy"], input=old_clipboard, text=True, encoding="utf-8")
 
 
 def toggle():
