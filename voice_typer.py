@@ -2,10 +2,17 @@
 whisper.cpp (GGML) 語音輸入工具
 啟動時會先在背景常駐一個 whisper-server（模型只載入一次），
 之後每次錄音只送 HTTP 請求過去轉錄，不用每次重新載入模型。
-按 Cmd+Shift+V 開始錄音，再按一次停止 → 自動轉錄（簡轉繁）並貼到目前作用中的欄位。
-用底層 Quartz event tap 攔截 Cmd+Shift+V，讓它不會同時觸發系統的「貼上並符合樣式」。
-用 Ctrl+C（終端機執行時）或 Cmd+Q / Dock 右鍵結束（打包成 App 執行時）結束程式，
-兩種方式都會一併關閉背景的 whisper-server。
+
+連按兩下 Fn（🌐）鍵開始錄音，再連按兩下停止 → 自動轉錄（簡轉繁）並貼到目前作用中的欄位，
+同時把這句話 append 進 TextEdit 裡的 session 逐字稿，方便回頭找剛剛講了什麼。
+（需要先到「系統設定 → 鍵盤 → 按下 🌐 鍵時」設成「不執行任何動作」，否則會跟系統原本的
+Fn 鍵功能（Emoji 選單/口述聽寫等）衝突。）
+
+實際辨識工作丟到背景執行緒處理，讓按鍵事件的回呼可以馬上返回——
+如果卡在回呼裡面太久，macOS 會自動停用這個 event tap，導致按鍵完全沒反應。
+
+右鍵點 Dock 圖示可以看到 Start Transcribing / End Transcribing / Quit 選單，
+Quit 跟 Ctrl+C（終端機執行時）都會一併關閉背景的 whisper-server。
 """
 
 import atexit
@@ -15,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -23,18 +31,13 @@ import Quartz
 import requests
 import sounddevice as sd
 import soundfile as sf
+from Cocoa import NSApplication, NSMenu, NSMenuItem, NSObject
+from PyObjCTools import AppHelper
 from pynput.keyboard import Controller as KeyboardController
 from pynput.keyboard import Key
 
-# Cmd+Shift+V：virtual keycode 9 = 'v'（ANSI 鍵盤配置）
-HOTKEY_KEYCODE = 9
-HOTKEY_FLAGS = Quartz.kCGEventFlagMaskCommand | Quartz.kCGEventFlagMaskShift
-RELEVANT_FLAGS_MASK = (
-    Quartz.kCGEventFlagMaskCommand
-    | Quartz.kCGEventFlagMaskShift
-    | Quartz.kCGEventFlagMaskAlternate
-    | Quartz.kCGEventFlagMaskControl
-)
+HOTKEY_HINT = "連按兩下 Fn"
+DOUBLE_PRESS_WINDOW = 0.5  # 秒，兩次按 Fn 之間的最大間隔
 
 SAMPLE_RATE = 16000
 chinese_converter = opencc.OpenCC("s2twp")  # 簡體 -> 繁體（台灣用語）
@@ -46,9 +49,14 @@ SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8090
 INFERENCE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}/inference"
 
+TRANSCRIPT_DIR = Path.home() / "Documents"
+TRANSCRIPT_NAME = "Voice Typer Transcript.txt"
+TRANSCRIPT_PATH = TRANSCRIPT_DIR / TRANSCRIPT_NAME
+
 kb = KeyboardController()
 recording = False
-audio_frames = []
+is_processing = False
+current_frames = None
 stream = None
 lock = threading.Lock()
 
@@ -60,6 +68,43 @@ def _escape_for_osascript(text: str) -> str:
 def notify(title: str, message: str) -> None:
     script = f'display notification "{_escape_for_osascript(message)}" with title "{_escape_for_osascript(title)}"'
     subprocess.run(["osascript", "-e", script])
+
+
+def _append_line_to_transcript_doc(line: str) -> None:
+    """透過 AppleScript 操作 TextEdit 本身來寫入，避免 Python 直接改檔案
+    跟 TextEdit 記憶體內容打架（外部檔案變動可能讓 TextEdit 跳出提示對話框）。
+    這個函式是 best-effort：任何失敗都靜默吞掉，不影響貼上流程。
+    """
+    escaped = _escape_for_osascript(line)
+    script = f'''
+    tell application "TextEdit"
+        if not (exists document "{TRANSCRIPT_NAME}") then
+            open POSIX file "{TRANSCRIPT_PATH}"
+        end if
+        activate
+        set targetDoc to document "{TRANSCRIPT_NAME}"
+        set text of targetDoc to (text of targetDoc) & "{escaped}" & linefeed
+        save targetDoc
+    end tell
+    '''
+    try:
+        subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        print(f"[transcript] 寫入 TextEdit 失敗（忽略，不影響貼上）: {e}")
+
+
+def open_transcript_window() -> None:
+    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    if not TRANSCRIPT_PATH.exists():
+        TRANSCRIPT_PATH.write_text("", encoding="utf-8")
+
+    divider = f"===== Session 開始 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ====="
+    _append_line_to_transcript_doc(divider)
+
+
+def append_to_transcript(text: str) -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    _append_line_to_transcript_doc(f"[{timestamp}] {text}")
 
 
 def start_whisper_server() -> subprocess.Popen:
@@ -90,24 +135,28 @@ def start_whisper_server() -> subprocess.Popen:
 server_proc = start_whisper_server()
 atexit.register(server_proc.terminate)
 
+open_transcript_window()
+
 print(f"whisper.cpp server 就緒（模型: {MODEL_PATH}）")
-print("按 Cmd+Shift+V 開始/停止錄音，按 Ctrl+C 結束程式。")
-notify("Voice Typer", "已就緒，按 Cmd+Shift+V 開始錄音")
-
-
-def audio_callback(indata, frames, time_info, status):
-    if recording:
-        audio_frames.append(indata.copy())
+print(f"按 {HOTKEY_HINT} 開始/停止錄音，或右鍵 Dock 圖示操作。")
+notify("Voice Typer", f"已就緒，按 {HOTKEY_HINT} 開始錄音")
 
 
 def start_recording():
-    global recording, audio_frames, stream
+    global recording, current_frames, stream
     with lock:
-        if recording:
+        if recording or is_processing:
             return
-        audio_frames = []
+        frames = []
+        current_frames = frames
+
+        # 每次錄音用自己專屬的 frames list（closure 綁定），就算上一個 stream
+        # 的 callback 延遲觸發，也只會寫進上一段已經用完的舊 list，不會污染新的這段。
+        def callback(indata, frame_count, time_info, status):
+            frames.append(indata.copy())
+
         recording = True
-        stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=audio_callback)
+        stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=callback)
         stream.start()
     print("🔴 開始錄音...")
     notify("Voice Typer", "🔴 開始錄音")
@@ -118,36 +167,56 @@ def transcribe(wav_path: str) -> str:
         resp = requests.post(INFERENCE_URL, files={"file": f}, data={"response_format": "json"})
     resp.raise_for_status()
     text = resp.json().get("text", "").strip()
+    # whisper-server 每個語音片段之間會插入換行符號，但片段本身通常已經
+    # 帶有自然的空格/標點分隔，直接把換行去掉即可還原成連續的句子。
+    text = text.replace("\n", "")
     return chinese_converter.convert(text)
 
 
 def stop_recording_and_transcribe():
-    global recording, stream
+    """只做『停止錄音』這件快事，馬上返回。實際辨識丟到背景執行緒，
+    避免按鍵事件的回呼卡住太久被 macOS 判定逾時、自動停用 event tap。
+    """
+    global recording, stream, is_processing, current_frames
     with lock:
         if not recording:
             return
         recording = False
+        is_processing = True
         stream.stop()
         stream.close()
+        frames = current_frames
+        current_frames = None
     print("⏹ 停止錄音，轉錄中...")
+    notify("Voice Typer", "⏳ 辨識中，請稍候...")
 
-    if not audio_frames:
-        print("沒有錄到聲音")
-        return
+    threading.Thread(target=_process_recording, args=(frames,), daemon=True).start()
 
-    audio = np.concatenate(audio_frames, axis=0).flatten()
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-        sf.write(tmp.name, audio, SAMPLE_RATE, subtype="PCM_16")
-        text = transcribe(tmp.name)
+def _process_recording(frames) -> None:
+    global is_processing
+    try:
+        if not frames:
+            print("沒有錄到聲音")
+            notify("Voice Typer", "沒有錄到聲音")
+            return
 
-    print("轉錄結果:", text)
+        audio = np.concatenate(frames, axis=0).flatten()
 
-    if text:
-        paste_via_clipboard(text)
-        notify("Voice Typer", text[:80])
-    else:
-        notify("Voice Typer", "沒有聽清楚，請再試一次")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+            sf.write(tmp.name, audio, SAMPLE_RATE, subtype="PCM_16")
+            text = transcribe(tmp.name)
+
+        print("轉錄結果:", text)
+
+        if text:
+            paste_via_clipboard(text)
+            append_to_transcript(text)
+            notify("Voice Typer", text[:80])
+        else:
+            notify("Voice Typer", "沒有聽清楚，請再試一次")
+    finally:
+        is_processing = False
 
 
 def paste_via_clipboard(text: str) -> None:
@@ -165,19 +234,43 @@ def paste_via_clipboard(text: str) -> None:
 
 
 def toggle():
+    if is_processing:
+        print("目前正在辨識中，忽略這次觸發")
+        return
     if recording:
         stop_recording_and_transcribe()
     else:
         start_recording()
 
 
+fn_previously_down = False
+last_fn_down_time = 0.0
+
+
 def event_tap_callback(proxy, event_type, event, refcon):
-    if event_type == Quartz.kCGEventKeyDown:
-        keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
-        flags = Quartz.CGEventGetFlags(event) & RELEVANT_FLAGS_MASK
-        if keycode == HOTKEY_KEYCODE and flags == HOTKEY_FLAGS:
-            toggle()
-            return None  # 吞掉事件，不讓它傳到目前作用中的 App（避免觸發系統的貼上）
+    global fn_previously_down, last_fn_down_time
+
+    # macOS 在回呼太慢時會自動停用 tap，這裡收到停用通知就立刻重新啟用，
+    # 當作保險（正常情況下背景執行緒化之後回呼應該都很快，不會被停用）。
+    if event_type in (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput):
+        print("[debug] event tap 被系統停用，重新啟用")
+        Quartz.CGEventTapEnable(tap, True)
+        return event
+
+    if event_type == Quartz.kCGEventFlagsChanged:
+        flags = Quartz.CGEventGetFlags(event)
+        fn_down = bool(flags & Quartz.kCGEventFlagMaskSecondaryFn)
+
+        if fn_down and not fn_previously_down:
+            now = time.monotonic()
+            if now - last_fn_down_time <= DOUBLE_PRESS_WINDOW:
+                last_fn_down_time = 0.0  # 重置，避免連續按三下又誤判成第二次雙擊
+                toggle()
+            else:
+                last_fn_down_time = now
+
+        fn_previously_down = fn_down
+
     return event
 
 
@@ -185,26 +278,82 @@ tap = Quartz.CGEventTapCreate(
     Quartz.kCGSessionEventTap,
     Quartz.kCGHeadInsertEventTap,
     Quartz.kCGEventTapOptionDefault,
-    Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown),
+    Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged),
     event_tap_callback,
     None,
 )
 if tap is None:
-    raise RuntimeError("無法建立 event tap，請確認 Terminal 已加入「輸入監控」與「輔助使用」權限")
+    raise RuntimeError("無法建立 event tap，請確認 Voice Typer 已加入「輸入監控」與「輔助使用」權限")
 
 run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
-Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), run_loop_source, Quartz.kCFRunLoopCommonModes)
+Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetMain(), run_loop_source, Quartz.kCFRunLoopCommonModes)
 Quartz.CGEventTapEnable(tap, True)
 
+
+def quit_app() -> None:
+    print("結束程式")
+    try:
+        server_proc.terminate()
+    except Exception:
+        pass
+    AppHelper.stopEventLoop()
+
+
+class AppDelegate(NSObject):
+    def applicationDockMenu_(self, sender):
+        menu = NSMenu.alloc().init()
+
+        start_title = f"Start Transcribing  {HOTKEY_HINT}"
+        stop_title = f"End Transcribing  {HOTKEY_HINT}"
+        if is_processing:
+            stop_title = "⏳ Transcribing..."
+
+        start_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            start_title, "startTranscribing:", ""
+        )
+        start_item.setTarget_(self)
+        start_item.setEnabled_(not recording and not is_processing)
+        menu.addItem_(start_item)
+
+        stop_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            stop_title, "endTranscribing:", ""
+        )
+        stop_item.setTarget_(self)
+        stop_item.setEnabled_(recording and not is_processing)
+        menu.addItem_(stop_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Quit", "quitFromMenu:", "")
+        quit_item.setTarget_(self)
+        menu.addItem_(quit_item)
+
+        return menu
+
+    def startTranscribing_(self, sender):
+        start_recording()
+
+    def endTranscribing_(self, sender):
+        stop_recording_and_transcribe()
+
+    def quitFromMenu_(self, sender):
+        quit_app()
+
+
 def handle_sigterm(signum, frame):
-    raise SystemExit(0)
+    quit_app()
 
 
 signal.signal(signal.SIGTERM, handle_sigterm)
+signal.signal(signal.SIGINT, handle_sigterm)  # 確保用 Terminal 跑時 Ctrl+C 也能可靠結束
+
+app = NSApplication.sharedApplication()
+delegate = AppDelegate.alloc().init()
+app.setDelegate_(delegate)
 
 try:
-    while True:
-        Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 1.0, False)
-except (KeyboardInterrupt, SystemExit):
-    print("結束程式")
-    sys.exit(0)
+    AppHelper.runEventLoop()
+except KeyboardInterrupt:
+    quit_app()
+
+sys.exit(0)
