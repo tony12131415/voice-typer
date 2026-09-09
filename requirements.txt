@@ -8,3 +8,4 @@ pyobjc-framework-Cocoa==12.2.2
 requests==2.34.2
 opencc-python-reimplemented==0.1.7
 py2app==0.28.10
+sherpa-onnx==1.13.7

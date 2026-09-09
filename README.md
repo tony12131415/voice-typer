@@ -13,6 +13,7 @@ macOS 上用 [whisper.cpp](https://github.com/ggml-org/whisper.cpp)（GGML 版 W
 - **Dock 選單**：右鍵點 Dock 圖示可以看到 `Start Transcribing` / `End Transcribing` / `Quit`，狀態不對的選項會自動反灰（例如辨識中兩個都不能點）
 - **簡轉繁**：轉錄結果用 [OpenCC](https://github.com/BYVoid/OpenCC)（`s2twp`）從簡體轉成繁體台灣用語
 - **自動去除多餘換行**：whisper 每個語音片段之間預設會插入換行，這裡會還原成連續的自然斷句
+- **獨立標點還原**：whisper 的標點符號是靠音訊裡的停頓判斷的，講話中間不停頓（碎念式講法）就完全不會加標點。這裡改用 [FunASR](https://github.com/modelscope/FunASR) 的 CT-Transformer 標點還原模型（透過 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 跑本機 ONNX 推論，單句約幾毫秒），純粹從文字語意判斷該加哪個標點，不受講話停頓影響，繁體中文與中英夾雜都支援（作法參考自 [VibeTyping](https://github.com/chenlu-hung/VibeTyping)）
 - **Session 逐字稿**：每次轉錄結果也會即時 append 進一個 TextEdit 視窗（`~/Documents/Voice Typer Transcript.txt`），方便回頭找剛剛講了什麼，就算貼上的地方一時找不到也不會遺失內容
 - **狀態通知**：沒有終端機視窗時（打包成 App 執行），用 macOS 系統通知顯示「開始錄音」「⏳ 辨識中」「轉錄結果」等狀態，log 寫到 `~/Library/Logs/VoiceTyper.log`
 
@@ -34,7 +35,17 @@ curl -L -o ~/models/whisper-cpp/ggml-large-v3-turbo.bin \
 
 其他模型大小（tiny/base/small/medium/large-v3）可以到 [ggerganov/whisper.cpp 的 Hugging Face repo](https://huggingface.co/ggerganov/whisper.cpp) 選，速度和準確度自己抓平衡。改路徑的話要同步改 `voice_typer.py` 裡的 `MODEL_PATH`。
 
-### 3. 建立 Python 環境
+### 3. 下載標點還原模型
+
+```bash
+mkdir -p ~/models/sherpa-onnx-punct
+cd ~/models/sherpa-onnx-punct
+curl -L -o punct.tar.bz2 \
+  "https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8.tar.bz2"
+tar xjf punct.tar.bz2 && rm punct.tar.bz2
+```
+
+### 4. 建立 Python 環境
 
 ```bash
 python3 -m venv ~/venvs/breeze-asr
@@ -42,7 +53,7 @@ source ~/venvs/breeze-asr/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4.（可選）打包成 App，放到 Applications
+### 5.（可選）打包成 App，放到 Applications
 
 ```bash
 ./build_app.sh
@@ -91,6 +102,7 @@ Ctrl+C 結束（會一併關閉背景的 whisper-server）。
 - 想換語言限定（例如只認英文）：把 `LANGUAGE = "auto"` 改成 `"en"` / `"zh"` 等
 - 想改雙擊時間窗：改 `DOUBLE_PRESS_WINDOW`（秒）
 - 想改逐字稿存放位置：改 `TRANSCRIPT_DIR` / `TRANSCRIPT_NAME`
+- 想關掉標點還原（直接用 whisper 原始輸出）：把 `transcribe()` 裡呼叫 `punct_restorer.add_punctuation(text)` 那段拿掉
 
 ## 已知限制
 

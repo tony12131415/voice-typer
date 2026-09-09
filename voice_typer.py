@@ -48,6 +48,7 @@ import numpy as np
 import opencc
 import Quartz
 import requests
+import sherpa_onnx
 import sounddevice as sd
 import soundfile as sf
 from Cocoa import NSApplication, NSMenu, NSMenuItem, NSObject
@@ -60,6 +61,24 @@ DOUBLE_PRESS_WINDOW = 0.5  # 秒，兩次按 Fn 之間的最大間隔
 
 SAMPLE_RATE = 16000
 chinese_converter = opencc.OpenCC("s2twp")  # 簡體 -> 繁體（台灣用語）
+
+# whisper 的標點符號是靠音訊停頓判斷的，講話中間沒停頓就不會加標點。
+# 這裡改用獨立的文字標點還原模型（FunASR CT-Transformer，透過 sherpa-onnx
+# 跑 ONNX 推論），純粹從文字語意判斷該加哪個標點，不受講話停頓影響。
+PUNCT_MODEL_DIR = (
+    Path.home()
+    / "models"
+    / "sherpa-onnx-punct"
+    / "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
+)
+punct_restorer = sherpa_onnx.OfflinePunctuation(
+    sherpa_onnx.OfflinePunctuationConfig(
+        model=sherpa_onnx.OfflinePunctuationModelConfig(
+            ct_transformer=str(PUNCT_MODEL_DIR / "model.int8.onnx"),
+            num_threads=2,
+        ),
+    )
+)
 
 WHISPER_SERVER_BIN = "/opt/homebrew/bin/whisper-server"
 MODEL_PATH = str(Path.home() / "models" / "whisper-cpp" / "ggml-large-v3-turbo.bin")
@@ -195,6 +214,8 @@ def transcribe(wav_path: str) -> str:
     # whisper-server 每個語音片段之間會插入換行符號，但片段本身通常已經
     # 帶有自然的空格/標點分隔，直接把換行去掉即可還原成連續的句子。
     text = text.replace("\n", "")
+    if text:
+        text = punct_restorer.add_punctuation(text)
     return chinese_converter.convert(text)
 
 
